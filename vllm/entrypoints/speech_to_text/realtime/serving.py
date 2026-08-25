@@ -1,14 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import asyncio
-from collections.abc import AsyncGenerator
 from functools import cached_property
 from typing import Literal, cast
 
-import numpy as np
-
-from vllm.engine.protocol import EngineClient, StreamingInput
+from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
@@ -52,37 +48,15 @@ class OpenAIServingRealtime(GenerateBaseServing):
         model_cls = get_model_cls(self.model_config)
         return cast(type[SupportsRealtime], model_cls)
 
-    async def transcribe_realtime(
-        self,
-        audio_stream: AsyncGenerator[np.ndarray, None],
-        input_stream: asyncio.Queue[list[int]],
-    ) -> AsyncGenerator[StreamingInput, None]:
-        """Transform audio stream into StreamingInput for engine.generate().
+    async def render_prompt(self, prompt: PromptType):
+        """Render one prompt into the engine's input form.
+
+        Only the continued-session path needs this; an independent decode passes its
+        prompt to ``generate`` directly.
 
         Args:
-            audio_stream: Async generator yielding float32 numpy audio arrays
-            input_stream: Queue containing context token IDs from previous
-                generation outputs. Used for autoregressive multi-turn
-                processing where each generation's output becomes the context
-                for the next iteration.
-
-        Yields:
-            StreamingInput objects containing audio prompts for the engine
+            prompt: A prompt from a model's ``Decode`` command.
         """
-        model_config = self.model_config
-        renderer = self.renderer
-
-        # mypy is being stupid
-        # TODO(Patrick) - fix this
-        stream_input_iter = cast(
-            AsyncGenerator[PromptType, None],
-            self.model_cls.buffer_realtime_audio(
-                audio_stream, input_stream, model_config
-            ),
-        )
-
-        async for prompt in stream_input_iter:
-            parsed_prompt = parse_model_prompt(model_config, prompt)
-            (engine_input,) = await renderer.render_cmpl_async([parsed_prompt])
-
-            yield StreamingInput(prompt=engine_input)
+        parsed_prompt = parse_model_prompt(self.model_config, prompt)
+        (engine_input,) = await self.renderer.render_cmpl_async([parsed_prompt])
+        return engine_input

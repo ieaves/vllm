@@ -49,6 +49,11 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
     from vllm.model_executor.models.interfaces_base import VllmModel
     from vllm.model_executor.models.utils import WeightsMapper
+    from vllm.entrypoints.speech_to_text.realtime.session import (
+        AudioStream,
+        Command,
+        DecodeResult,
+    )
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.multimodal.registry import _ProcessorFactories
     from vllm.sequence import IntermediateTensors
@@ -1130,16 +1135,24 @@ class SupportsRealtime(Protocol):
     supports_realtime: ClassVar[Literal[True]] = True
 
     realtime_max_tokens: ClassVar[int] = 1
-    """Maximum tokens to generate per streaming audio segment.
-    Override in subclasses based on the model's expected output length."""
+    """Default token budget for one decode, when the model does not size its own."""
 
     @classmethod
-    async def buffer_realtime_audio(
+    def realtime_session(
         cls,
-        audio_stream: AsyncGenerator[np.ndarray, None],
-        input_stream: asyncio.Queue[list[int]],
+        audio: "AudioStream",
         model_config: "ModelConfig",
-    ) -> AsyncGenerator["PromptType", None]: ...
+    ) -> AsyncGenerator["Command", "DecodeResult"]:
+        """Drive one transcription turn.
+
+        Yields ``Decode`` to run the model, receiving that decode's result back from the
+        yield; yields ``Emit`` to deliver text to the client. Returning ends the turn.
+
+        Args:
+            audio: The turn's audio, read at whatever cadence the model chooses.
+            model_config: Supplies the tokenizer and feature extractor.
+        """
+        ...
 
 
 @overload

@@ -16,6 +16,13 @@ from mistral_common.tokens.tokenizers.audio import Audio, AudioConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.speech_to_text import SpeechToTextParams
+from vllm.entrypoints.speech_to_text.realtime.session import (
+    AudioStream,
+    Command,
+    Decode,
+    DecodeResult,
+    Emit,
+)
 from vllm.engine.protocol import StreamingInput
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
@@ -231,55 +238,62 @@ class VoxtralRealtimeGeneration(VoxtralForConditionalGeneration, SupportsRealtim
 
     # for realtime transcription
     @classmethod
-    async def buffer_realtime_audio(
+    async def realtime_session(
         cls,
-        audio_stream: AsyncGenerator[np.ndarray, None],
-        input_stream: asyncio.Queue[list[int]],
+        audio: AudioStream,
         model_config: ModelConfig,
-    ) -> AsyncGenerator[PromptType, None]:
+    ) -> AsyncGenerator[Command, DecodeResult]:
+        """Transcribe a turn as one continuing session, a frame and a token at a time.
+
+        The codec emits a fixed number of text tokens per audio frame, so each decode
+        appends to the turn's request rather than starting a fresh one, and the token it
+        produces becomes part of the next frame's prompt.
+        """
         tokenizer = cached_tokenizer_from_config(model_config)
         audio_encoder = tokenizer.instruct.audio_encoder
         config = audio_encoder.audio_config
 
-        # Get prompt tokens (streaming prefix tokens) without encoding audio
         prompt_tokens = (
             tokenizer.instruct.start() + audio_encoder.encode_streaming_tokens()
         )
-
-        # Get left/right padding audio
         left_pad, right_pad = audio_encoder.get_padding_audio()
-
         buffer = VoxtralRealtimeBuffer(config, prompt_tokens)
 
-        # Feed audio with padding into buffer in background
         async def feed_audio():
-            yielded_first_chunk = False
-            async for audio_chunk in audio_stream:
-                if not yielded_first_chunk:
-                    yielded_first_chunk = True
-                    # Prepend left padding before first real audio
-                    await buffer.append_audio(left_pad.audio_array)
-                await buffer.append_audio(audio_chunk)
-            # Append right padding at the end
-            await buffer.append_audio(right_pad.audio_array)
-            await buffer.append_audio(None)  # signal end
-
-        # Feed output tokens back into the buffer. Idle waits are normal here;
-        # request cleanup still cancels this task through the finally block.
-        async def feed_tokens():
+            padded = False
             while True:
-                all_outputs = await input_stream.get()
-                await buffer.append_tokens(all_outputs[-1:])
+                chunk = await audio.read(min_samples=1)
+                if chunk is None:
+                    break
+                if not padded:
+                    padded = True
+                    await buffer.append_audio(left_pad.audio_array)
+                await buffer.append_audio(chunk)
+            await buffer.append_audio(right_pad.audio_array)
+            await buffer.append_audio(None)
 
         audio_task = asyncio.create_task(feed_audio())
-        token_task = asyncio.create_task(feed_tokens())
+        frames = buffer.get_input_stream()
 
         try:
-            async for streaming_input in buffer.get_input_stream():
-                yield streaming_input.prompt
+            while True:
+                try:
+                    streaming_input = await frames.__anext__()
+                except StopAsyncIteration:
+                    break
+                result = yield Decode(
+                    prompt=streaming_input.prompt,
+                    max_tokens=cls.realtime_max_tokens,
+                    continue_session=True,
+                )
+                if result is None:
+                    break
+                await buffer.append_tokens(result.token_ids[-1:])
+                if result.text:
+                    yield Emit(result.text)
         finally:
             audio_task.cancel()
-            token_task.cancel()
+            await frames.aclose()
 
     @property
     def audio_config(self):

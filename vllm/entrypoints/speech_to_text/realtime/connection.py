@@ -27,6 +27,7 @@ from .protocol import (
     TranscriptionDone,
 )
 from .serving import OpenAIServingRealtime
+from .session import AudioStream, Decode, DecodeResult, Emit
 
 logger = init_logger(__name__)
 
@@ -160,110 +161,69 @@ class RealtimeConnection:
         else:
             await self.send_error(f"Unknown event type: {event_type}", "unknown_event")
 
-    async def audio_stream_generator(self) -> AsyncGenerator[np.ndarray, None]:
-        """Generator that yields audio chunks from the queue."""
-        while True:
-            audio_chunk = await self.audio_queue.get()
-            if audio_chunk is None:  # Sentinel value to stop
-                break
-            yield audio_chunk
-
     async def start_generation(self):
-        """Start the transcription generation task."""
+        """Start the transcription turn."""
         if self.generation_task is not None and not self.generation_task.done():
             logger.warning("Generation already in progress, ignoring commit")
             return
 
-        # Create audio stream generator
-        audio_stream = self.audio_stream_generator()
-        input_stream = asyncio.Queue[list[int]]()
-
-        # Transform to StreamingInput generator
-        streaming_input_gen = self.serving.transcribe_realtime(
-            audio_stream, input_stream
+        audio = AudioStream(self.audio_queue)
+        session = self.serving.model_cls.realtime_session(
+            audio, self.serving.model_config
         )
+        self.generation_task = asyncio.create_task(self._run_session(session))
 
-        # Start generation task
-        self.generation_task = asyncio.create_task(
-            self._run_generation(streaming_input_gen, input_stream)
-        )
+    async def _run_session(self, session: AsyncGenerator):
+        """Interpret the model's commands for one turn.
 
-    async def _run_generation(
-        self,
-        streaming_input_gen: AsyncGenerator,
-        input_stream: asyncio.Queue[list[int]],
-    ):
-        """Run the generation and stream results back to the client.
-
-        This method:
-        1. Creates sampling parameters from session config
-        2. Passes the streaming input generator to engine.generate()
-        3. Streams transcription.delta events as text is generated
-        4. Sends final transcription.done event with usage stats
-        5. Feeds generated token IDs back to input_stream for next iteration
-        6. Cleans up the audio queue
+        ``transcription.done`` carries exactly the concatenation of the deltas sent,
+        because both come from the same ``Emit`` commands.
         """
-        request_id = f"rt-{self.connection_id}-{uuid4()}"
-        full_text = ""
-
-        prompt_token_ids_len: int = 0
-        completion_tokens_len: int = 0
+        emitted: list[str] = []
+        prompt_tokens = 0
+        completion_tokens = 0
+        executor = _DecodeExecutor(self)
 
         try:
-            # Create sampling params
-            from vllm.sampling_params import RequestOutputKind, SamplingParams
+            result: DecodeResult | None = None
+            while True:
+                try:
+                    command = await session.asend(result)
+                except StopAsyncIteration:
+                    break
+                result = None
 
-            sampling_params = SamplingParams.from_optional(
-                temperature=0.0,
-                max_tokens=self.serving.model_cls.realtime_max_tokens,
-                output_kind=RequestOutputKind.DELTA,
-                skip_clone=True,
-            )
-
-            # Pass the streaming input generator to the engine
-            # The engine will consume audio chunks as they arrive and
-            # stream back transcription results incrementally
-            result_gen = self.serving.engine_client.generate(
-                prompt=streaming_input_gen,
-                sampling_params=sampling_params,
-                request_id=request_id,
-            )
-
-            # Stream results back to client as they're generated
-            async for output in result_gen:
-                if output.outputs and len(output.outputs) > 0:
-                    if not prompt_token_ids_len and output.prompt_token_ids:
-                        prompt_token_ids_len = len(output.prompt_token_ids)
-
-                    delta = output.outputs[0].text
-                    full_text += delta
-
-                    # append output to input
-                    input_stream.put_nowait(list(output.outputs[0].token_ids))
-                    await self.send(TranscriptionDelta(delta=delta))
-
-                    completion_tokens_len += len(output.outputs[0].token_ids)
+                if isinstance(command, Emit):
+                    if command.text:
+                        emitted.append(command.text)
+                        await self.send(TranscriptionDelta(delta=command.text))
+                elif isinstance(command, Decode):
+                    result = await executor.run(command)
+                    prompt_tokens += result.prompt_tokens
+                    completion_tokens += len(result.token_ids)
+                else:
+                    raise TypeError(
+                        f"unsupported realtime command: {type(command).__name__}"
+                    )
 
                 if not self._is_connected:
-                    # finish because websocket connection was killed
                     break
 
             usage = UsageInfo(
-                prompt_tokens=prompt_token_ids_len,
-                completion_tokens=completion_tokens_len,
-                total_tokens=prompt_token_ids_len + completion_tokens_len,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
             )
-
-            # Send final completion event
-            await self.send(TranscriptionDone(text=full_text, usage=usage))
-
-            # Clear queue for next utterance
-            while not self.audio_queue.empty():
-                self.audio_queue.get_nowait()
+            await self.send(TranscriptionDone(text="".join(emitted), usage=usage))
 
         except Exception as e:
-            logger.exception("Error in generation: %s", e)
+            logger.exception("Error in realtime session: %s", e)
             await self.send_error(sanitize_message(str(e)), "processing_error")
+        finally:
+            await executor.aclose()
+            await session.aclose()
+            while not self.audio_queue.empty():
+                self.audio_queue.get_nowait()
 
     async def send(
         self, event: SessionCreated | TranscriptionDelta | TranscriptionDone
@@ -287,3 +247,97 @@ class RealtimeConnection:
             self.generation_task.cancel()
 
         logger.debug("Connection cleanup complete: %s", self.connection_id)
+
+
+class _DecodeExecutor:
+    """Runs the ``Decode`` commands of one turn.
+
+    A decode with ``continue_session`` set joins the turn's streaming request so its
+    KV persists; every other decode is an independent request that shares no state.
+    """
+
+    def __init__(self, connection: RealtimeConnection) -> None:
+        self._connection = connection
+        self._prompts: asyncio.Queue | None = None
+        self._outputs: AsyncGenerator | None = None
+
+    async def run(self, command: Decode) -> DecodeResult:
+        """Execute one decode and return what it produced."""
+        if command.continue_session:
+            return await self._run_continued(command)
+        return await self._run_fresh(command)
+
+    async def _run_fresh(self, command: Decode) -> DecodeResult:
+        from vllm.sampling_params import RequestOutputKind, SamplingParams
+
+        params = SamplingParams.from_optional(
+            temperature=command.temperature,
+            max_tokens=command.max_tokens,
+            output_kind=RequestOutputKind.FINAL_ONLY,
+            prompt_logprobs=command.logprobs,
+        )
+        request_id = f"rt-{self._connection.connection_id}-{uuid4()}"
+        final = None
+        async for output in self._connection.serving.engine_client.generate(
+            prompt=command.prompt,
+            sampling_params=params,
+            request_id=request_id,
+        ):
+            final = output
+        return _as_result(final)
+
+    async def _run_continued(self, command: Decode) -> DecodeResult:
+        from vllm.sampling_params import RequestOutputKind, SamplingParams
+
+        if self._outputs is None:
+            self._prompts = asyncio.Queue()
+            params = SamplingParams.from_optional(
+                temperature=command.temperature,
+                max_tokens=command.max_tokens,
+                output_kind=RequestOutputKind.DELTA,
+                skip_clone=True,
+            )
+            self._outputs = self._connection.serving.engine_client.generate(
+                prompt=self._prompt_stream(),
+                sampling_params=params,
+                request_id=f"rt-{self._connection.connection_id}-{uuid4()}",
+            ).__aiter__()
+
+        assert self._prompts is not None
+        await self._prompts.put(command.prompt)
+        try:
+            return _as_result(await self._outputs.__anext__())
+        except StopAsyncIteration:
+            return DecodeResult(text="", token_ids=(), finish_reason="stop", prompt_tokens=0)
+
+    async def _prompt_stream(self) -> AsyncGenerator:
+        from vllm.engine.protocol import StreamingInput
+
+        assert self._prompts is not None
+        while True:
+            prompt = await self._prompts.get()
+            if prompt is None:
+                return
+            rendered = await self._connection.serving.render_prompt(prompt)
+            yield StreamingInput(prompt=rendered)
+
+    async def aclose(self) -> None:
+        """Release the streaming request, if one was opened."""
+        if self._prompts is not None:
+            self._prompts.put_nowait(None)
+        if self._outputs is not None:
+            await self._outputs.aclose()
+            self._outputs = None
+
+
+def _as_result(output) -> DecodeResult:
+    """Project an engine output onto the model-facing result type."""
+    if output is None or not output.outputs:
+        return DecodeResult(text="", token_ids=(), finish_reason=None, prompt_tokens=0)
+    completion = output.outputs[0]
+    return DecodeResult(
+        text=completion.text,
+        token_ids=tuple(completion.token_ids),
+        finish_reason=completion.finish_reason,
+        prompt_tokens=len(output.prompt_token_ids or ()),
+    )
